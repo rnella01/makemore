@@ -12,13 +12,14 @@ Changes from minGPT:
   difference at the scale that we operate on here.
 """
 
+import argparse
+import math
 import os
 import sys
 import time
-import math
-import argparse
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import List
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -31,8 +32,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class ModelConfig:
-    block_size: int = None # length of the input sequences of integers
-    vocab_size: int = None # the input integers are in range [0 .. vocab_size -1]
+    block_size: int | None = None # length of the input sequences of integers
+    vocab_size: int | None = None # the input integers are in range [0 .. vocab_size -1]
     # parameters below control the sizes of each model slightly differently
     n_layer: int = 4
     n_embd: int = 64
@@ -56,6 +57,7 @@ class CausalSelfAttention(nn.Module):
     It is possible to use torch.nn.MultiheadAttention here but I am including an
     explicit implementation here to show that there is nothing too scary here.
     """
+    bias: torch.Tensor
 
     def __init__(self, config):
         super().__init__()
@@ -92,6 +94,7 @@ class CausalSelfAttention(nn.Module):
 
 class Block(nn.Module):
     """ an unassuming Transformer block """
+    mlpf: Callable[[Any], Any]
 
     def __init__(self, config):
         super().__init__()
@@ -104,7 +107,8 @@ class Block(nn.Module):
             act     = NewGELU(),
         ))
         m = self.mlp
-        self.mlpf = lambda x: m.c_proj(m.act(m.c_fc(x))) # MLP forward
+        # Type checker doesn't understand ModuleDict indexing returns callable modules
+        self.mlpf = lambda x: m.c_proj(m.act(m.c_fc(x)))  # type: ignore[misc]
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -128,7 +132,7 @@ class Transformer(nn.Module):
 
         # report number of parameters (note we don't count the decoder parameters in lm_head)
         n_params = sum(p.numel() for p in self.transformer.parameters())
-        print("number of parameters: %.2fM" % (n_params/1e6,))
+        print(f"number of parameters: {n_params/1e6:.2f}M")
 
     def get_block_size(self):
         return self.block_size
@@ -140,12 +144,13 @@ class Transformer(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        # Type checker doesn't understand ModuleDict indexing returns callable modules
+        tok_emb = self.transformer.wte(idx)  # type: ignore[misc]
+        pos_emb = self.transformer.wpe(pos)  # type: ignore[misc]
         x = tok_emb + pos_emb
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+        for block in self.transformer.h:  # type: ignore[attr-defined]
+            x = block(x)  # type: ignore[misc]
+        x = self.transformer.ln_f(x)  # type: ignore[misc]
         logits = self.lm_head(x)
 
         # if we are given some desired targets also calculate the loss
@@ -163,6 +168,8 @@ class CausalBoW(nn.Module):
     Causal bag of words. Averages the preceding elements and looks suspiciously like
     a CausalAttention module you'd find in a transformer, for no apparent reason at all ;)
     """
+    bias: torch.Tensor
+
     def __init__(self, config):
         super().__init__()
 
@@ -184,6 +191,7 @@ class CausalBoW(nn.Module):
 
 class BoWBlock(nn.Module):
     """ collects BoW features and adds an MLP """
+    mlpf: Callable[[Any], Any]
 
     def __init__(self, config):
         super().__init__()
@@ -196,7 +204,8 @@ class BoWBlock(nn.Module):
             c_proj  = nn.Linear(config.n_embd2, config.n_embd),
         ))
         m = self.mlp
-        self.mlpf = lambda x: m.c_proj(F.tanh(m.c_fc(x))) # MLP forward
+        # Type checker doesn't understand ModuleDict indexing returns callable modules
+        self.mlpf = lambda x: m.c_proj(F.tanh(m.c_fc(x)))  # type: ignore[misc]
 
     def forward(self, x):
         x = x + self.cbow(x)
@@ -318,7 +327,6 @@ class RNN(nn.Module):
         return self.block_size
 
     def forward(self, idx, targets=None):
-        device = idx.device
         b, t = idx.size()
 
         # embed all the integers up front and all at once for efficiency
@@ -376,7 +384,7 @@ class MLP(nn.Module):
 
         # gather the word embeddings of the previous 3 words
         embs = []
-        for k in range(self.block_size):
+        for _ in range(self.block_size):
             tok_emb = self.wte(idx) # token embeddings of shape (b, t, n_embd)
             idx = torch.roll(idx, 1, 1)
             idx[:, 0] = self.vocab_size # special <BLANK> token
@@ -503,7 +511,7 @@ def evaluate(model, dataset, batch_size=50, max_batches=None):
 # -----------------------------------------------------------------------------
 # helper functions for creating the training and test Datasets that emit words
 
-class CharDataset(Dataset):
+class CharDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
     def __init__(self, words, chars, max_word_length):
         self.words = words
@@ -532,8 +540,8 @@ class CharDataset(Dataset):
         word = ''.join(self.itos[i] for i in ix)
         return word
 
-    def __getitem__(self, idx):
-        word = self.words[idx]
+    def __getitem__(self, index) -> tuple[torch.Tensor, torch.Tensor]:
+        word = self.words[index]
         ix = self.encode(word)
         x = torch.zeros(self.max_word_length + 1, dtype=torch.long)
         y = torch.zeros(self.max_word_length + 1, dtype=torch.long)
@@ -545,7 +553,7 @@ class CharDataset(Dataset):
 def create_datasets(input_file):
 
     # preprocessing of the input text file
-    with open(input_file, 'r') as f:
+    with open(input_file) as f:
         data = f.read()
     words = data.splitlines()
     words = [w.strip() for w in words] # get rid of any leading or trailing white space
@@ -601,8 +609,8 @@ if __name__ == '__main__':
     parser.add_argument('--resume', action='store_true', help="when this flag is used, we will resume optimization from existing model in the workdir")
     parser.add_argument('--sample-only', action='store_true', help="just sample from the model and quit, don't train")
     parser.add_argument('--num-workers', '-n', type=int, default=4, help="number of data workers for both train/test")
-    parser.add_argument('--max-steps', type=int, default=-1, help="max number of optimization steps to run for, or -1 for infinite.")
-    parser.add_argument('--device', type=str, default='cpu', help="device to use for compute, examples: cpu|cuda|cuda:2|mps")
+    parser.add_argument('--max-steps', type=int, default=5000, help="max number of optimization steps to run for, or -1 for infinite.")
+    parser.add_argument('--device', type=str, default='gpu', help="device to use for compute, examples: cpu|cuda|cuda:2|mps")
     parser.add_argument('--seed', type=int, default=3407, help="seed")
     # sampling
     parser.add_argument('--top-k', type=int, default=-1, help="top-k for sampling, -1 means no top-k")
@@ -616,7 +624,11 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', '-b', type=int, default=32, help="batch size during optimization")
     parser.add_argument('--learning-rate', '-l', type=float, default=5e-4, help="learning rate")
     parser.add_argument('--weight-decay', '-w', type=float, default=0.01, help="weight decay")
-    args = parser.parse_args()
+    # Use empty args list when running in Jupyter notebook to avoid kernel argument conflicts
+    if 'ipykernel' in sys.modules:
+        args = parser.parse_args([])
+    else:
+        args = parser.parse_args()
     print(vars(args))
 
     # system inits
